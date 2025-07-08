@@ -1,0 +1,651 @@
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, collection, doc, getDocs, addDoc, setDoc, deleteDoc, onSnapshot, serverTimestamp } from 'firebase/firestore';
+import { PlusCircle, Trash2, ArrowRight, Users, DollarSign, ChevronDown, Wallet, FileDown, Home, LogIn, X, Loader, AlertTriangle } from 'lucide-react';
+
+// --- Configuración de Firebase ---
+// Estas variables se inyectarán en el entorno de ejecución.
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+// --- Componente Principal: App ---
+const App = () => {
+    // --- Estado de autenticación y datos ---
+    const [auth, setAuth] = useState(null);
+    const [db, setDb] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    const [scriptsLoaded, setScriptsLoaded] = useState(false);
+
+    // --- Estado de navegación ---
+    const [currentView, setCurrentView] = useState('home'); // 'home' o 'account'
+    const [selectedAccountId, setSelectedAccountId] = useState(null);
+
+    // --- Cargar scripts de PDF de forma dinámica y secuencial ---
+    useEffect(() => {
+        const loadScript = (src) => {
+            return new Promise((resolve, reject) => {
+                if (document.querySelector(`script[src="${src}"]`)) {
+                    resolve();
+                    return;
+                }
+                const script = document.createElement('script');
+                script.src = src;
+                script.onload = () => resolve();
+                script.onerror = () => reject(new Error(`Script load error for ${src}`));
+                document.body.appendChild(script);
+            });
+        };
+
+        // Cargar scripts secuencialmente para asegurar que jspdf esté disponible para el plugin autotable
+        loadScript("https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js")
+            .then(() => loadScript("https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.23/jspdf.plugin.autotable.min.js"))
+            .then(() => {
+                setScriptsLoaded(true);
+            }).catch(error => console.error("Error loading PDF scripts:", error));
+    }, []);
+
+    // --- Inicialización de Firebase y Autenticación (CORREGIDO) ---
+    useEffect(() => {
+        try {
+            const app = initializeApp(firebaseConfig);
+            const authInstance = getAuth(app);
+            const dbInstance = getFirestore(app);
+            setAuth(authInstance);
+            setDb(dbInstance);
+
+            const unsubscribe = onAuthStateChanged(authInstance, async (user) => {
+                if (user) {
+                    // El usuario está autenticado, establecemos el ID y marcamos como listo.
+                    setUserId(user.uid);
+                    setIsAuthReady(true);
+                } else {
+                    // El usuario no está autenticado, intentamos iniciar sesión.
+                    try {
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await signInWithCustomToken(authInstance, __initial_auth_token);
+                        } else {
+                            await signInAnonymously(authInstance);
+                        }
+                    } catch (authError) {
+                        console.error("Falló el inicio de sesión con token, recurriendo a anónimo:", authError);
+                        // Si falla el token personalizado, intentamos como anónimo como último recurso.
+                        try {
+                           await signInAnonymously(authInstance);
+                        } catch (anonError) {
+                           console.error("Falló también el inicio de sesión anónimo:", anonError);
+                           // Si todo falla, marcamos como listo para no dejar la app cargando infinitamente.
+                           setIsAuthReady(true);
+                        }
+                    }
+                }
+            });
+            return () => unsubscribe();
+        } catch (error) {
+            console.error("Error al inicializar Firebase:", error);
+            setIsAuthReady(true);
+        }
+    }, []);
+
+
+    const navigateToAccount = (accountId) => {
+        setSelectedAccountId(accountId);
+        setCurrentView('account');
+    };
+
+    const navigateToHome = () => {
+        setSelectedAccountId(null);
+        setCurrentView('home');
+    };
+
+    if (!isAuthReady || !scriptsLoaded) {
+        return <LoadingScreen message="Conectando y preparando todo..." />;
+    }
+    
+    if (!userId) {
+        return <LoadingScreen message="Error de autenticación. No se pueden cargar los datos." />;
+    }
+
+    return (
+        <div className="bg-gray-900 text-white min-h-screen font-sans">
+            {currentView === 'home' ? (
+                <HomeScreen db={db} userId={userId} onOpenAccount={navigateToAccount} />
+            ) : (
+                <AccountView db={db} userId={userId} accountId={selectedAccountId} onNavigateHome={navigateToHome} />
+            )}
+        </div>
+    );
+};
+
+// --- Pantalla de Carga ---
+const LoadingScreen = ({ message }) => (
+    <div className="flex flex-col justify-center items-center min-h-screen bg-gray-900 text-white">
+        <Loader className="animate-spin text-cyan-400 mb-4" size={48} />
+        <p className="text-xl">{message}</p>
+    </div>
+);
+
+// --- Pantalla de Inicio (Gestor de Cuentas) ---
+const HomeScreen = ({ db, userId, onOpenAccount }) => {
+    const [accounts, setAccounts] = useState([]);
+    const [isLoading, setIsLoading] = useState(true);
+    const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
+    const [newAccountName, setNewAccountName] = useState('');
+    const [confirmDeleteModal, setConfirmDeleteModal] = useState({ isOpen: false, accountId: null });
+
+    const accountsCollectionPath = `artifacts/${appId}/users/${userId}/accounts`;
+
+    // --- Cargar cuentas desde Firestore ---
+    useEffect(() => {
+        if (!db || !userId) return;
+        const accountsCol = collection(db, accountsCollectionPath);
+        const unsubscribe = onSnapshot(accountsCol, (snapshot) => {
+            const accountsList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setAccounts(accountsList);
+            setIsLoading(false);
+        }, (error) => {
+            console.error("Error al cargar cuentas:", error);
+            setIsLoading(false);
+        });
+        return () => unsubscribe();
+    }, [db, userId, accountsCollectionPath]);
+
+    const handleCreateAccount = async () => {
+        if (!newAccountName.trim() || !db || !userId) return;
+        const accountsCol = collection(db, accountsCollectionPath);
+        try {
+            await addDoc(accountsCol, {
+                name: newAccountName,
+                createdAt: serverTimestamp(),
+                people: [{ id: 1, name: 'Persona 1' }, { id: 2, name: 'Persona 2' }],
+                expenses: [],
+                nextPersonId: 3,
+            });
+            setNewAccountName('');
+            setIsCreateModalOpen(false);
+        } catch (error) {
+            console.error("Error al crear cuenta:", error);
+        }
+    };
+    
+    const handleDeleteClick = (accountId) => {
+        setConfirmDeleteModal({ isOpen: true, accountId: accountId });
+    };
+
+    const confirmDeleteAccount = async () => {
+        if (!confirmDeleteModal.accountId) return;
+        try {
+            const accountDoc = doc(db, accountsCollectionPath, confirmDeleteModal.accountId);
+            await deleteDoc(accountDoc);
+            setConfirmDeleteModal({ isOpen: false, accountId: null });
+        } catch (error) {
+            console.error("Error al eliminar cuenta:", error);
+            setConfirmDeleteModal({ isOpen: false, accountId: null });
+        }
+    };
+
+    return (
+        <div className="max-w-4xl mx-auto p-4 sm:p-6 md:p-8">
+            <header className="text-center mb-8">
+                <h1 className="text-4xl sm:text-5xl font-bold text-cyan-400 tracking-tight">Mis Cuentas</h1>
+                <p className="text-gray-400 mt-2">Selecciona una cuenta para ver o crea una nueva.</p>
+            </header>
+            <div className="text-center mb-8">
+                <button onClick={() => setIsCreateModalOpen(true)} className="bg-cyan-600 hover:bg-cyan-700 text-white font-bold py-3 px-6 rounded-lg flex items-center justify-center gap-2 transition-transform transform hover:scale-105 mx-auto">
+                    <PlusCircle size={20} /> Crear Nueva Cuenta
+                </button>
+            </div>
+            {isLoading ? (
+                <LoadingScreen message="Cargando cuentas..." />
+            ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                    {accounts.length === 0 && <p className="text-gray-400 col-span-full text-center">No tienes cuentas. ¡Crea la primera!</p>}
+                    {accounts.map(acc => (
+                        <div key={acc.id} className="bg-gray-800 rounded-xl shadow-lg p-5 flex flex-col justify-between hover:ring-2 ring-cyan-500 transition-all">
+                            <h2 className="text-xl font-bold text-white truncate mb-2">{acc.name}</h2>
+                            <p className="text-sm text-gray-400 mb-4">Creada: {acc.createdAt?.toDate().toLocaleDateString() || 'Recién'}</p>
+                            <div className="flex gap-2 mt-auto">
+                                <button onClick={() => onOpenAccount(acc.id)} className="flex-1 bg-green-600 hover:bg-green-700 text-white font-semibold py-2 px-4 rounded-lg transition">Abrir</button>
+                                <button onClick={() => handleDeleteClick(acc.id)} className="bg-red-600 hover:bg-red-700 text-white p-2 rounded-lg transition"><Trash2 size={20} /></button>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            )}
+
+            {isCreateModalOpen && (
+                <div className="fixed inset-0 bg-black bg-opacity-70 flex justify-center items-center z-50">
+                    <div className="bg-gray-800 rounded-xl p-8 w-full max-w-md m-4">
+                        <h2 className="text-2xl font-bold mb-4">Crear Nueva Cuenta</h2>
+                        <input
+                            type="text"
+                            value={newAccountName}
+                            onChange={(e) => setNewAccountName(e.target.value)}
+                            placeholder="Ej: Viaje a la playa"
+                            className="w-full bg-gray-700 border-2 border-gray-600 rounded-lg px-3 py-2 focus:outline-none focus:border-cyan-500 transition mb-4"
+                        />
+                        <div className="flex justify-end gap-4">
+                            <button onClick={() => setIsCreateModalOpen(false)} className="bg-gray-600 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded-lg">Cancelar</button>
+                            <button onClick={handleCreateAccount} className="bg-cyan-600 hover:bg-cyan-700 text-white font-bold py-2 px-4 rounded-lg">Crear</button>
+                        </div>
+                    </div>
+                </div>
+            )}
+            
+            {confirmDeleteModal.isOpen && (
+                 <div className="fixed inset-0 bg-black bg-opacity-70 flex justify-center items-center z-50">
+                    <div className="bg-gray-800 rounded-xl p-8 w-full max-w-md m-4 text-center">
+                        <AlertTriangle className="text-red-500 mx-auto mb-4" size={48} />
+                        <h2 className="text-2xl font-bold mb-2">¿Confirmar Eliminación?</h2>
+                        <p className="text-gray-400 mb-6">Esta acción no se puede deshacer.</p>
+                        <div className="flex justify-center gap-4">
+                            <button onClick={() => setConfirmDeleteModal({isOpen: false, accountId: null})} className="bg-gray-600 hover:bg-gray-700 text-white font-bold py-2 px-6 rounded-lg">Cancelar</button>
+                            <button onClick={confirmDeleteAccount} className="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-6 rounded-lg">Eliminar</button>
+                        </div>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+};
+
+// --- Vista de una Cuenta Específica ---
+const AccountView = ({ db, userId, accountId, onNavigateHome }) => {
+    const [account, setAccount] = useState(null);
+    const [isLoading, setIsLoading] = useState(true);
+
+    const accountDocPath = `artifacts/${appId}/users/${userId}/accounts/${accountId}`;
+    const accountDocRef = useMemo(() => doc(db, accountDocPath), [db, accountDocPath]);
+
+    // --- Cargar y escuchar datos de la cuenta ---
+    useEffect(() => {
+        if (!db || !userId || !accountId) return;
+        const unsubscribe = onSnapshot(accountDocRef, (doc) => {
+            if (doc.exists()) {
+                setAccount({ id: doc.id, ...doc.data() });
+            } else {
+                console.error("La cuenta no existe o no tienes permiso.");
+                onNavigateHome(); // Volver al home si la cuenta no se encuentra
+            }
+            setIsLoading(false);
+        }, (error) => {
+            console.error("Error al cargar la cuenta:", error);
+            setIsLoading(false);
+        });
+        return () => unsubscribe();
+    }, [db, userId, accountId, accountDocRef, onNavigateHome]);
+
+    // --- Funciones para actualizar datos en Firestore ---
+    const updateAccountData = useCallback(async (data) => {
+        try {
+            await setDoc(accountDocRef, data, { merge: true });
+        } catch (error) {
+            console.error("Error al actualizar la cuenta:", error);
+        }
+    }, [accountDocRef]);
+
+    const addPerson = () => {
+        if (account.people.length < 10) {
+            const newPersonName = `Persona ${account.people.length + 1}`;
+            const newPerson = { id: account.nextPersonId, name: newPersonName };
+            updateAccountData({
+                people: [...account.people, newPerson],
+                nextPersonId: account.nextPersonId + 1
+            });
+        }
+    };
+
+    const removePerson = () => {
+        if (account.people.length > 2) {
+            const lastPerson = account.people[account.people.length - 1];
+            updateAccountData({
+                people: account.people.slice(0, -1),
+                expenses: account.expenses.filter(exp => exp.paidBy !== lastPerson.id)
+            });
+        }
+    };
+    
+    const updatePersonName = (id, newName) => {
+        updateAccountData({
+            people: account.people.map(p => p.id === id ? { ...p, name: newName } : p)
+        });
+    };
+
+    const addExpense = (expense) => {
+        updateAccountData({
+            expenses: [...account.expenses, { ...expense, id: Date.now() }]
+        });
+    };
+
+    const deleteExpense = (id) => {
+        updateAccountData({
+            expenses: account.expenses.filter(exp => exp.id !== id)
+        });
+    };
+
+    // --- Lógica de cálculo (sin cambios) ---
+    const { totalExpensesByCurrency, settlements } = useMemo(() => {
+        if (!account) return { totalExpensesByCurrency: {}, settlements: {} };
+        const { expenses, people } = account;
+        const currencies = ['USD', 'EUR', 'ARS', 'MXN', 'COP'];
+
+        const totalExpensesByCurrency = {};
+        expenses.forEach(expense => {
+            if (!totalExpensesByCurrency[expense.currency]) {
+                totalExpensesByCurrency[expense.currency] = 0;
+            }
+            totalExpensesByCurrency[expense.currency] += expense.amount;
+        });
+
+        const settlementsByCurrency = {};
+        currencies.forEach(currency => {
+            const expensesInCurrency = expenses.filter(exp => exp.currency === currency);
+            if (expensesInCurrency.length === 0) return;
+            const totalSpent = expensesInCurrency.reduce((sum, exp) => sum + exp.amount, 0);
+            const share = totalSpent / people.length;
+            const balances = people.map(person => {
+                const paid = expensesInCurrency.filter(exp => exp.paidBy === person.id).reduce((sum, exp) => sum + exp.amount, 0);
+                return { id: person.id, name: person.name, balance: paid - share };
+            });
+            const debtors = balances.filter(p => p.balance < 0).sort((a, b) => a.balance - b.balance);
+            const creditors = balances.filter(p => p.balance > 0).sort((a, b) => b.balance - a.balance);
+            const transactions = [];
+            let i = 0, j = 0;
+            while (i < debtors.length && j < creditors.length) {
+                const debtor = debtors[i];
+                const creditor = creditors[j];
+                const amount = Math.min(-debtor.balance, creditor.balance);
+                if (amount > 0.01) {
+                    transactions.push({ from: debtor.name, to: creditor.name, amount: amount, currency: currency });
+                }
+                debtor.balance += amount;
+                creditor.balance -= amount;
+                if (Math.abs(debtor.balance) < 0.01) i++;
+                if (Math.abs(creditor.balance) < 0.01) j++;
+            }
+            if (transactions.length > 0) {
+                settlementsByCurrency[currency] = transactions;
+            }
+        });
+        return { totalExpensesByCurrency, settlements: settlementsByCurrency };
+    }, [account]);
+    
+    // --- Función para Exportar a PDF ---
+    const generatePDF = () => {
+        if (!account || typeof window.jspdf === 'undefined') {
+            console.error("jsPDF library not loaded yet.");
+            return;
+        }
+
+        const { jsPDF } = window.jspdf;
+        const doc = new jsPDF();
+
+        if (typeof doc.autoTable !== 'function') {
+            console.error("jsPDF-autoTable plugin not loaded correctly.");
+            return;
+        }
+
+        const getPersonName = (id) => account.people.find(p => p.id === id)?.name || 'N/A';
+        
+        // Título
+        doc.setFontSize(22);
+        doc.text(`Reporte de Gastos: ${account.name}`, 14, 22);
+        doc.setFontSize(11);
+        doc.setTextColor(100);
+        doc.text(`Generado el: ${new Date().toLocaleString()}`, 14, 28);
+
+        // Participantes
+        doc.autoTable({
+            startY: 35,
+            head: [['Participantes']],
+            body: account.people.map(p => [p.name]),
+            theme: 'striped',
+            headStyles: { fillColor: [34, 197, 94] }
+        });
+
+        // Totales por Moneda
+        doc.autoTable({
+            startY: doc.autoTable.previous.finalY + 10,
+            head: [['Moneda', 'Gasto Total']],
+            body: Object.entries(totalExpensesByCurrency).map(([curr, total]) => [curr, total.toFixed(2)]),
+            theme: 'grid',
+            headStyles: { fillColor: [14, 165, 233] }
+        });
+        
+        // Balance Final
+        const settlementData = [];
+        Object.values(settlements).forEach(transactions => {
+            transactions.forEach(t => {
+                settlementData.push([t.from, t.to, `${t.amount.toFixed(2)} ${t.currency}`]);
+            });
+        });
+
+        if (settlementData.length > 0) {
+            doc.autoTable({
+                startY: doc.autoTable.previous.finalY + 10,
+                head: [['Quien Paga', 'Quien Recibe', 'Monto']],
+                body: settlementData,
+                theme: 'striped',
+                headStyles: { fillColor: [219, 39, 119] }
+            });
+        } else {
+             doc.text("¡Todas las cuentas están saldadas!", 14, doc.autoTable.previous.finalY + 15);
+        }
+
+        // Historial de Gastos
+        if (account.expenses.length > 0) {
+            doc.autoTable({
+                startY: doc.autoTable.previous.finalY + 10,
+                head: [['Descripción', 'Monto', 'Pagado por']],
+                body: account.expenses.map(e => [e.description, `${e.amount.toFixed(2)} ${e.currency}`, getPersonName(e.paidBy)]),
+                theme: 'grid',
+                headStyles: { fillColor: [75, 85, 99] }
+            });
+        }
+        
+        doc.save(`Reporte_${account.name.replace(/\s/g, '_')}.pdf`);
+    };
+
+    if (isLoading) {
+        return <LoadingScreen message="Cargando datos de la cuenta..." />;
+    }
+
+    if (!account) {
+        return <div className="p-8 text-center text-red-500">No se pudo cargar la cuenta.</div>;
+    }
+
+    const { people, expenses } = account;
+    const currencies = ['USD', 'EUR', 'ARS', 'MXN', 'COP'];
+
+    return (
+        <div className="max-w-4xl mx-auto p-4 sm:p-6 md:p-8">
+            <header className="text-center mb-8 relative">
+                 <button onClick={onNavigateHome} className="absolute left-0 top-1/2 -translate-y-1/2 bg-gray-700 hover:bg-gray-600 p-3 rounded-full transition">
+                    <Home size={20} />
+                </button>
+                <h1 className="text-3xl sm:text-4xl font-bold text-cyan-400 tracking-tight">{account.name}</h1>
+                <button onClick={generatePDF} className="absolute right-0 top-1/2 -translate-y-1/2 bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg flex items-center gap-2 transition">
+                    <FileDown size={18} /> <span className="hidden sm:inline">Exportar</span>
+                </button>
+            </header>
+
+            <main className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                {/* Columna Izquierda */}
+                <div className="flex flex-col gap-8">
+                    <SettingsPanel peopleCount={people.length} onAddPerson={addPerson} onRemovePerson={removePerson} />
+                    <PeopleManager people={people} onUpdatePersonName={updatePersonName} />
+                    <ExpenseForm people={people} onAddExpense={addExpense} currencies={currencies} />
+                </div>
+                {/* Columna Derecha */}
+                <div className="flex flex-col gap-8">
+                      <TotalExpensesPanel totals={totalExpensesByCurrency} />
+                      <ResultsPanel settlements={settlements} />
+                      <ExpenseList expenses={expenses} people={people} onDeleteExpense={deleteExpense} />
+                </div>
+            </main>
+        </div>
+    );
+};
+
+
+// --- Sub-componentes (sin cambios en su lógica interna, solo reciben props) ---
+const SettingsPanel = ({ peopleCount, onAddPerson, onRemovePerson }) => (
+    <div className="bg-gray-800 p-6 rounded-xl shadow-lg">
+        <h2 className="text-2xl font-semibold mb-4 text-cyan-300 flex items-center"><Users className="mr-3"/>Configuración</h2>
+        <div className="flex items-center justify-between">
+            <span className="text-gray-300 text-lg">Número de personas:</span>
+            <div className="flex items-center gap-3">
+                <button onClick={onRemovePerson} className="bg-red-600 hover:bg-red-700 p-2 rounded-full transition-transform transform hover:scale-110 disabled:bg-gray-600 disabled:cursor-not-allowed" disabled={peopleCount <= 2}>
+                    <Trash2 size={16} />
+                </button>
+                <span className="text-xl font-bold w-8 text-center">{peopleCount}</span>
+                <button onClick={onAddPerson} className="bg-green-600 hover:bg-green-700 p-2 rounded-full transition-transform transform hover:scale-110 disabled:bg-gray-600 disabled:cursor-not-allowed" disabled={peopleCount >= 10}>
+                    <PlusCircle size={16} />
+                </button>
+            </div>
+        </div>
+    </div>
+);
+
+const PeopleManager = ({ people, onUpdatePersonName }) => (
+    <div className="bg-gray-800 p-6 rounded-xl shadow-lg">
+        <h2 className="text-2xl font-semibold mb-4 text-cyan-300">Participantes</h2>
+        <div className="space-y-3">
+            {people.map(person => (
+                <div key={person.id} className="flex items-center">
+                    <span className="text-cyan-400 mr-3">{`P${person.id}:`}</span>
+                    <input
+                        type="text"
+                        value={person.name}
+                        onChange={(e) => onUpdatePersonName(person.id, e.target.value)}
+                        className="w-full bg-gray-700 border-2 border-gray-600 rounded-lg px-3 py-2 focus:outline-none focus:border-cyan-500 transition"
+                        placeholder={`Nombre de Persona ${person.id}`}
+                    />
+                </div>
+            ))}
+        </div>
+    </div>
+);
+
+const ExpenseForm = ({ people, onAddExpense, currencies }) => {
+    const [description, setDescription] = useState('');
+    const [amount, setAmount] = useState('');
+    const [currency, setCurrency] = useState(currencies[0]);
+    const [paidBy, setPaidBy] = useState(people[0]?.id || '');
+
+    const handleSubmit = (e) => {
+        e.preventDefault();
+        if (!description || !amount || !paidBy || parseFloat(amount) <= 0) return;
+        onAddExpense({ description, amount: parseFloat(amount), currency, paidBy: parseInt(paidBy) });
+        setDescription('');
+        setAmount('');
+    };
+    
+    useEffect(() => {
+        if (!people.some(p => p.id === paidBy)) {
+            setPaidBy(people[0]?.id || '');
+        }
+    }, [people, paidBy]);
+
+    return (
+        <form onSubmit={handleSubmit} className="bg-gray-800 p-6 rounded-xl shadow-lg space-y-4">
+            <h2 className="text-2xl font-semibold text-cyan-300">Añadir Nuevo Gasto</h2>
+            <input id="description" type="text" value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Descripción (Ej: Cena, Super...)" className="w-full bg-gray-700 border-2 border-gray-600 rounded-lg px-3 py-2 focus:outline-none focus:border-cyan-500 transition" />
+            <div className="grid grid-cols-2 gap-4">
+                <input id="amount" type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="Monto" className="w-full bg-gray-700 border-2 border-gray-600 rounded-lg px-3 py-2 focus:outline-none focus:border-cyan-500 transition" />
+                <select id="currency" value={currency} onChange={(e) => setCurrency(e.target.value)} className="w-full bg-gray-700 border-2 border-gray-600 rounded-lg px-3 py-2 focus:outline-none focus:border-cyan-500 transition">
+                    {currencies.map(c => <option key={c} value={c}>{c}</option>)}
+                </select>
+            </div>
+            <select id="paidBy" value={paidBy} onChange={(e) => setPaidBy(parseInt(e.target.value))} className="w-full bg-gray-700 border-2 border-gray-600 rounded-lg px-3 py-2 focus:outline-none focus:border-cyan-500 transition">
+                {people.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+            <button type="submit" className="w-full bg-cyan-600 hover:bg-cyan-700 text-white font-bold py-3 rounded-lg flex items-center justify-center gap-2 transition-transform transform hover:scale-105">
+                <PlusCircle size={20} /> Añadir Gasto
+            </button>
+        </form>
+    );
+};
+
+const ExpenseList = ({ expenses, people, onDeleteExpense }) => {
+    const [isOpen, setIsOpen] = useState(false);
+    const getPersonName = (id) => people.find(p => p.id === id)?.name || 'Desconocido';
+
+    return (
+        <div className="bg-gray-800 rounded-xl shadow-lg">
+            <button onClick={() => setIsOpen(!isOpen)} className="w-full p-6 text-left flex justify-between items-center">
+                <h2 className="text-2xl font-semibold text-cyan-300">Historial de Gastos</h2>
+                <ChevronDown className={`transform transition-transform duration-300 ${isOpen ? 'rotate-180' : ''}`} size={24} />
+            </button>
+            {isOpen && (
+                <div className="px-6 pb-6 space-y-3 max-h-60 overflow-y-auto pr-2 animate-fade-in">
+                    {expenses.length === 0 ? (
+                        <p className="text-gray-400 text-center py-4">Aún no hay gastos registrados.</p>
+                    ) : (
+                        [...expenses].reverse().map(expense => (
+                            <div key={expense.id} className="bg-gray-700 p-3 rounded-lg flex items-center justify-between">
+                                <div>
+                                    <p className="font-semibold text-white">{expense.description}</p>
+                                    <p className="text-sm text-gray-400">Pagado por: {getPersonName(expense.paidBy)}</p>
+                                </div>
+                                <div className="flex items-center gap-4">
+                                   <span className="font-bold text-cyan-400 text-lg">{expense.amount.toFixed(2)} {expense.currency}</span>
+                                   <button onClick={() => onDeleteExpense(expense.id)} className="text-red-500 hover:text-red-400 transition-colors">
+                                     <Trash2 size={18} />
+                                   </button>
+                                </div>
+                            </div>
+                        ))
+                    )}
+                </div>
+            )}
+        </div>
+    );
+};
+
+const ResultsPanel = ({ settlements }) => (
+    <div className="bg-gray-800 p-6 rounded-xl shadow-lg">
+        <h2 className="text-2xl font-semibold mb-4 text-cyan-300 flex items-center"><DollarSign className="mr-3"/>Balance Final</h2>
+        <div className="space-y-4">
+            {Object.keys(settlements).length === 0 && ( <p className="text-gray-400 text-center py-4">Añade gastos para ver los resultados.</p> )}
+            {Object.keys(settlements).length > 0 && Object.values(settlements).every(arr => arr.length === 0) && ( <p className="text-green-400 text-center font-semibold py-4">¡Todas las cuentas están saldadas!</p> )}
+            {Object.entries(settlements).map(([currency, transactions]) => (
+                transactions.length > 0 &&
+                <div key={currency}>
+                    <h3 className="text-lg font-semibold text-cyan-400 border-b-2 border-gray-700 pb-1 mb-2">Deudas en {currency}</h3>
+                    <div className="space-y-2">
+                        {transactions.map((trans, index) => (
+                            <div key={index} className="bg-gray-700 p-3 rounded-lg flex items-center justify-center text-center animate-fade-in">
+                                <span className="font-medium text-white">{trans.from}</span>
+                                <ArrowRight className="mx-4 text-cyan-500" size={20}/>
+                                <span className="font-medium text-white">{trans.to}</span>
+                                <span className="ml-auto font-bold text-lg text-green-400">{trans.amount.toFixed(2)} {trans.currency}</span>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            ))}
+        </div>
+    </div>
+);
+
+const TotalExpensesPanel = ({ totals }) => (
+    <div className="bg-gray-800 p-6 rounded-xl shadow-lg">
+        <h2 className="text-2xl font-semibold mb-4 text-cyan-300 flex items-center"><Wallet className="mr-3"/>Gasto Total</h2>
+        <div className="space-y-2">
+            {Object.keys(totals).length === 0 ? (
+                <p className="text-gray-400 text-center py-4">No hay gastos para mostrar.</p>
+            ) : (
+                Object.entries(totals).map(([currency, total]) => (
+                    <div key={currency} className="flex justify-between items-center bg-gray-700 p-3 rounded-lg">
+                        <span className="text-lg font-medium text-white">{currency}</span>
+                        <span className="text-xl font-bold text-cyan-400">{total.toFixed(2)}</span>
+                    </div>
+                ))
+            )}
+        </div>
+    </div>
+);
+
+export default App;
