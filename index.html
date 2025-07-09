@@ -435,7 +435,77 @@
                 return { totalExpensesByCurrency, settlements: settlementsByCurrency };
             }, [account]);
             
-            const generatePDF = () => { /* ... PDF logic ... */ };
+            const generatePDF = useCallback(() => {
+                if (!account || typeof window.jspdf === 'undefined') {
+                    console.error("jsPDF library not loaded yet.");
+                    return;
+                }
+
+                const { jsPDF } = window.jspdf;
+                const doc = new jsPDF();
+
+                if (typeof doc.autoTable !== 'function') {
+                    console.error("jsPDF-autoTable plugin not loaded correctly.");
+                    return;
+                }
+
+                const getPersonName = (id) => account.people.find(p => p.id === id)?.name || 'N/A';
+                
+                doc.setFontSize(22);
+                doc.text(`Reporte de Gastos: ${account.name}`, 14, 22);
+                doc.setFontSize(11);
+                doc.setTextColor(100);
+                doc.text(`Generado el: ${new Date().toLocaleString()}`, 14, 28);
+
+                doc.autoTable({
+                    startY: 35,
+                    head: [['Participantes']],
+                    body: account.people.map(p => [p.name]),
+                    theme: 'striped',
+                    headStyles: { fillColor: [34, 197, 94] }
+                });
+
+                if(Object.keys(totalExpensesByCurrency).length > 0) {
+                    doc.autoTable({
+                        startY: doc.autoTable.previous.finalY + 10,
+                        head: [['Moneda', 'Gasto Total']],
+                        body: Object.entries(totalExpensesByCurrency).map(([curr, total]) => [curr, total.toFixed(2)]),
+                        theme: 'grid',
+                        headStyles: { fillColor: [14, 165, 233] }
+                    });
+                }
+                
+                const settlementData = [];
+                Object.values(settlements).forEach(transactions => {
+                    transactions.forEach(t => {
+                        settlementData.push([t.from, t.to, `${t.amount.toFixed(2)} ${t.currency}`]);
+                    });
+                });
+
+                if (settlementData.length > 0) {
+                    doc.autoTable({
+                        startY: doc.autoTable.previous.finalY + 10,
+                        head: [['Quien Paga', 'Quien Recibe', 'Monto']],
+                        body: settlementData,
+                        theme: 'striped',
+                        headStyles: { fillColor: [219, 39, 119] }
+                    });
+                } else {
+                     doc.text("¡Todas las cuentas están saldadas!", 14, doc.autoTable.previous.finalY + 15);
+                }
+
+                if (account.expenses.length > 0) {
+                    doc.autoTable({
+                        startY: doc.autoTable.previous.finalY + 10,
+                        head: [['Descripción', 'Categoría', 'Monto', 'Pagado por']],
+                        body: account.expenses.map(e => [e.description, e.category, `${e.amount.toFixed(2)} ${e.currency}`, getPersonName(e.paidBy)]),
+                        theme: 'grid',
+                        headStyles: { fillColor: [75, 85, 99] }
+                    });
+                }
+                
+                doc.save(`Reporte_${account.name.replace(/\s/g, '_')}.pdf`);
+            }, [account, totalExpensesByCurrency, settlements]);
 
             if (isLoading) return <LoadingScreen message="Cargando datos de la cuenta..." />;
             if (!account) return <div className="p-8 text-center text-red-500">No se pudo cargar la cuenta.</div>;
