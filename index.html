@@ -40,8 +40,7 @@
           messagingSenderId: "958749739714",
           appId: "1:958749739714:web:e27c7281e3b9c3cd31095b"
         };
-        const appId = 'divisor-de-gastos-fc581'; // Usamos el ID del proyecto directamente
-
+        
         // --- Iconos ---
         const Icon = ({ children, className = "h-6 w-6" }) => <div className={className}>{children}</div>;
         const PlusCircle = ({ size = 24 }) => <Icon className={`h-${size/4} w-${size/4}`}><svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="16"></line><line x1="8" y1="12" x2="16" y2="12"></line></svg></Icon>;
@@ -309,7 +308,7 @@
             const { useState, useEffect, useMemo, useCallback } = React;
             const [account, setAccount] = useState(null);
             const [isLoading, setIsLoading] = useState(true);
-            const [editingExpense, setEditingExpense] = useState(null); // State for editing
+            const [editingExpense, setEditingExpense] = useState(null);
 
             const accountDocRef = useMemo(() => {
                 if (!db || !userId || !accountId) return null;
@@ -353,37 +352,96 @@
                     exp.id === updatedExpense.id ? updatedExpense : exp
                 );
                 updateAccountData({ expenses: newExpenses });
-                setEditingExpense(null); // Close modal
+                setEditingExpense(null);
             };
 
-            const deleteExpense = (expenseToDelete) => {
-                updateAccountData({
-                    expenses: firebase.firestore.FieldValue.arrayRemove(expenseToDelete)
-                });
+            const deleteExpense = (expenseId) => {
+                const expenseToDelete = account.expenses.find(exp => exp.id === expenseId);
+                if (expenseToDelete) {
+                    updateAccountData({
+                        expenses: firebase.firestore.FieldValue.arrayRemove(expenseToDelete)
+                    });
+                }
             };
 
-            // People management functions (add, remove, update name) are the same
-            const addPerson = () => { /* ... same as before ... */ };
-            const removePerson = () => { /* ... same as before ... */ };
-            const updatePersonName = (id, newName) => { /* ... same as before ... */ };
+            const addPerson = () => {
+                if (account.people.length < 10) {
+                    const newPerson = { id: account.nextPersonId, name: `Persona ${account.nextPersonId}` };
+                    updateAccountData({
+                        people: firebase.firestore.FieldValue.arrayUnion(newPerson),
+                        nextPersonId: firebase.firestore.FieldValue.increment(1)
+                    });
+                }
+            };
 
-            // Calculation logic (useMemo) is the same
+            const removePerson = (personId) => {
+                if (account.people.length > 1) {
+                    const personToRemove = account.people.find(p => p.id === personId);
+                    const expensesToKeep = account.expenses.filter(exp => exp.paidBy !== personId);
+                    updateAccountData({
+                        people: firebase.firestore.FieldValue.arrayRemove(personToRemove),
+                        expenses: expensesToKeep
+                    });
+                }
+            };
+            
+            const updatePersonName = (id, newName) => {
+                const newPeople = account.people.map(p => p.id === id ? { ...p, name: newName } : p);
+                updateAccountData({ people: newPeople });
+            };
+
             const { totalExpensesByCurrency, settlements } = useMemo(() => {
-                if (!account || !account.people) return { totalExpensesByCurrency: {}, settlements: {} };
+                if (!account || !account.people || account.people.length === 0) return { totalExpensesByCurrency: {}, settlements: {} };
                 const { expenses, people } = account;
-                if (!people || people.length === 0) return { totalExpensesByCurrency: {}, settlements: {} };
-                // ... same calculation logic ...
-                return { totalExpensesByCurrency: {}, settlements: {} }; // Placeholder, real logic is complex
+                
+                const totalExpensesByCurrency = {};
+                expenses.forEach(expense => {
+                    if (!totalExpensesByCurrency[expense.currency]) {
+                        totalExpensesByCurrency[expense.currency] = 0;
+                    }
+                    totalExpensesByCurrency[expense.currency] += expense.amount;
+                });
+
+                const settlementsByCurrency = {};
+                CURRENCIES.forEach(currency => {
+                    const expensesInCurrency = expenses.filter(exp => exp.currency === currency);
+                    if (expensesInCurrency.length === 0) return;
+                    const totalSpent = expensesInCurrency.reduce((sum, exp) => sum + exp.amount, 0);
+                    const share = totalSpent / people.length;
+                    const balances = people.map(person => {
+                        const paid = expensesInCurrency.filter(exp => exp.paidBy === person.id).reduce((sum, exp) => sum + exp.amount, 0);
+                        return { id: person.id, name: person.name, balance: paid - share };
+                    });
+                    const debtors = balances.filter(p => p.balance < 0).sort((a, b) => a.balance - b.balance);
+                    const creditors = balances.filter(p => p.balance > 0).sort((a, b) => b.balance - a.balance);
+                    const transactions = [];
+                    let i = 0, j = 0;
+                    while (i < debtors.length && j < creditors.length) {
+                        const debtor = debtors[i];
+                        const creditor = creditors[j];
+                        const amount = Math.min(-debtor.balance, creditor.balance);
+                        if (amount > 0.01) {
+                            transactions.push({ from: debtor.name, to: creditor.name, amount: amount, currency: currency });
+                        }
+                        debtor.balance += amount;
+                        creditor.balance -= amount;
+                        if (Math.abs(debtor.balance) < 0.01) i++;
+                        if (Math.abs(creditor.balance) < 0.01) j++;
+                    }
+                    if (transactions.length > 0) {
+                        settlementsByCurrency[currency] = transactions;
+                    }
+                });
+                return { totalExpensesByCurrency, settlements: settlementsByCurrency };
             }, [account]);
             
-            // PDF generation is the same
-            const generatePDF = () => { /* ... same as before ... */ };
+            const generatePDF = () => { /* ... PDF logic ... */ };
 
             if (isLoading) return <LoadingScreen message="Cargando datos de la cuenta..." />;
             if (!account) return <div className="p-8 text-center text-red-500">No se pudo cargar la cuenta.</div>;
 
             return (
-                <div className="max-w-4xl mx-auto p-4 sm:p-6 md:p-8">
+                <div className="max-w-7xl mx-auto p-4 sm:p-6 md:p-8">
                     <header className="text-center mb-8 relative">
                          <button onClick={onNavigateHome} className="absolute left-0 top-1/2 -translate-y-1/2 bg-gray-700 hover:bg-gray-600 p-3 rounded-full transition"><Home size={20} /></button>
                          <h1 className="text-3xl sm:text-4xl font-bold text-cyan-400 tracking-tight">{account.name}</h1>
@@ -391,11 +449,13 @@
                     </header>
                     <main className="grid grid-cols-1 lg:grid-cols-2 gap-8">
                         <div className="flex flex-col gap-8">
-                            {/* ... SettingsPanel and PeopleManager ... */}
+                            <SettingsPanel peopleCount={account.people.length} onAddPerson={addPerson} />
+                            <PeopleManager people={account.people} onUpdatePersonName={updatePersonName} onRemovePerson={removePerson} />
                             <ExpenseForm people={account.people} onAddExpense={addExpense} />
                         </div>
                         <div className="flex flex-col gap-8">
-                              {/* ... TotalExpensesPanel and ResultsPanel ... */}
+                              <TotalExpensesPanel totals={totalExpensesByCurrency} />
+                              <ResultsPanel settlements={settlements} />
                               <ExpenseList expenses={account.expenses} people={account.people} onDeleteExpense={deleteExpense} onEditExpense={setEditingExpense} />
                         </div>
                     </main>
@@ -406,6 +466,7 @@
                                 onAddExpense={updateExpense} 
                                 expenseToEdit={editingExpense}
                                 isEditMode={true}
+                                onClose={() => setEditingExpense(null)}
                             />
                         </Modal>
                     )}
@@ -413,7 +474,44 @@
             );
         };
 
-        const ExpenseForm = ({ people, onAddExpense, expenseToEdit = null, isEditMode = false }) => {
+        const SettingsPanel = ({ peopleCount, onAddPerson }) => (
+            <div className="bg-gray-800 p-6 rounded-xl shadow-lg">
+                <h2 className="text-2xl font-semibold mb-4 text-cyan-300 flex items-center"><Users className="mr-3"/>Configuración</h2>
+                <div className="flex items-center justify-between">
+                    <span className="text-gray-300 text-lg">Número de personas:</span>
+                    <div className="flex items-center gap-3">
+                        <span className="text-xl font-bold w-8 text-center">{peopleCount}</span>
+                        <button onClick={onAddPerson} className="bg-green-600 hover:bg-green-700 p-2 rounded-full transition-transform transform hover:scale-110 disabled:bg-gray-600 disabled:cursor-not-allowed" disabled={peopleCount >= 10}>
+                            <PlusCircle size={16} />
+                        </button>
+                    </div>
+                </div>
+            </div>
+        );
+
+        const PeopleManager = ({ people, onUpdatePersonName, onRemovePerson }) => (
+            <div className="bg-gray-800 p-6 rounded-xl shadow-lg">
+                <h2 className="text-2xl font-semibold mb-4 text-cyan-300">Participantes</h2>
+                <div className="space-y-3">
+                    {people && people.map(person => (
+                        <div key={person.id} className="flex items-center gap-3">
+                            <input
+                                type="text"
+                                value={person.name}
+                                onChange={(e) => onUpdatePersonName(person.id, e.target.value)}
+                                className="w-full bg-gray-700 border-2 border-gray-600 rounded-lg px-3 py-2 focus:outline-none focus:border-cyan-500 transition"
+                                placeholder={`Nombre de Persona`}
+                            />
+                            <button onClick={() => onRemovePerson(person.id)} className="text-red-500 hover:text-red-400 p-2 rounded-full transition disabled:text-gray-600 disabled:cursor-not-allowed" disabled={people.length <= 1}>
+                                <Trash2 size={18} />
+                            </button>
+                        </div>
+                    ))}
+                </div>
+            </div>
+        );
+        
+        const ExpenseForm = ({ people, onAddExpense, expenseToEdit = null, isEditMode = false, onClose = () => {} }) => {
             const { useState, useEffect } = React;
             const [description, setDescription] = useState('');
             const [amount, setAmount] = useState('');
@@ -428,8 +526,10 @@
                     setCurrency(expenseToEdit.currency);
                     setCategory(expenseToEdit.category);
                     setPaidBy(expenseToEdit.paidBy);
+                } else {
+                    setPaidBy(people[0]?.id || '');
                 }
-            }, [expenseToEdit, isEditMode]);
+            }, [expenseToEdit, isEditMode, people]);
 
             const handleSubmit = (e) => {
                 e.preventDefault();
@@ -446,15 +546,17 @@
                 if (!isEditMode) {
                     setDescription('');
                     setAmount('');
+                } else {
+                    onClose(); // Cierra el modal al editar
                 }
             };
             
             return (
                 <form onSubmit={handleSubmit} className="bg-gray-800 p-6 rounded-xl shadow-lg space-y-4">
                     <h2 className="text-2xl font-semibold text-cyan-300">{isEditMode ? 'Editar Gasto' : 'Añadir Nuevo Gasto'}</h2>
-                    <input type="text" value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Descripción" className="w-full bg-gray-700 border-2 border-gray-600 rounded-lg px-3 py-2 focus:outline-none focus:border-cyan-500 transition" />
+                    <input type="text" value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Descripción" required className="w-full bg-gray-700 border-2 border-gray-600 rounded-lg px-3 py-2 focus:outline-none focus:border-cyan-500 transition" />
                     <div className="grid grid-cols-2 gap-4">
-                        <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="Monto" className="w-full bg-gray-700 border-2 border-gray-600 rounded-lg px-3 py-2 focus:outline-none focus:border-cyan-500 transition" />
+                        <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="Monto" required className="w-full bg-gray-700 border-2 border-gray-600 rounded-lg px-3 py-2 focus:outline-none focus:border-cyan-500 transition" />
                         <select value={currency} onChange={(e) => setCurrency(e.target.value)} className="w-full bg-gray-700 border-2 border-gray-600 rounded-lg px-3 py-2 focus:outline-none focus:border-cyan-500 transition">
                             {CURRENCIES.map(c => <option key={c} value={c}>{c}</option>)}
                         </select>
@@ -465,9 +567,12 @@
                     <select value={paidBy} onChange={(e) => setPaidBy(parseInt(e.target.value))} className="w-full bg-gray-700 border-2 border-gray-600 rounded-lg px-3 py-2 focus:outline-none focus:border-cyan-500 transition">
                         {people && people.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
                     </select>
-                    <button type="submit" className="w-full bg-cyan-600 hover:bg-cyan-700 text-white font-bold py-3 rounded-lg flex items-center justify-center gap-2 transition-transform transform hover:scale-105">
-                        <PlusCircle size={20} /> {isEditMode ? 'Guardar Cambios' : 'Añadir Gasto'}
-                    </button>
+                    <div className="flex gap-4">
+                        {isEditMode && <button type="button" onClick={onClose} className="w-full bg-gray-600 hover:bg-gray-700 text-white font-bold py-3 rounded-lg transition">Cancelar</button>}
+                        <button type="submit" className="w-full bg-cyan-600 hover:bg-cyan-700 text-white font-bold py-3 rounded-lg flex items-center justify-center gap-2 transition-transform transform hover:scale-105">
+                            <PlusCircle size={20} /> {isEditMode ? 'Guardar Cambios' : 'Añadir Gasto'}
+                        </button>
+                    </div>
                 </form>
             );
         };
@@ -495,7 +600,7 @@
                                         <div className="flex items-center gap-3">
                                            <span className="font-bold text-cyan-400 text-lg">{expense.amount.toFixed(2)} {expense.currency}</span>
                                            <button onClick={() => onEditExpense(expense)} className="text-blue-400 hover:text-blue-300 transition-colors"><Pencil size={18} /></button>
-                                           <button onClick={() => onDeleteExpense(expense)} className="text-red-500 hover:text-red-400 transition-colors"><Trash2 size={18} /></button>
+                                           <button onClick={() => onDeleteExpense(expense.id)} className="text-red-500 hover:text-red-400 transition-colors"><Trash2 size={18} /></button>
                                         </div>
                                     </div>
                                 ))
@@ -508,14 +613,49 @@
             );
         };
         
-        // --- Resto de componentes (ResultsPanel, TotalExpensesPanel, PeopleManager, etc.) ---
-        // Estos componentes se mantienen igual que en la versión anterior.
-        // Por brevedad, no se repiten aquí, pero deben estar en el código final.
-        const ResultsPanel = ({ settlements }) => ( <div className="bg-gray-800 p-6 rounded-xl shadow-lg">...</div> );
-        const TotalExpensesPanel = ({ totals }) => ( <div className="bg-gray-800 p-6 rounded-xl shadow-lg">...</div> );
-        const SettingsPanel = ({ peopleCount, onAddPerson, onRemovePerson }) => ( <div className="bg-gray-800 p-6 rounded-xl shadow-lg">...</div> );
-        const PeopleManager = ({ people, onUpdatePersonName }) => ( <div className="bg-gray-800 p-6 rounded-xl shadow-lg">...</div> );
+        const ResultsPanel = ({ settlements }) => (
+            <div className="bg-gray-800 p-6 rounded-xl shadow-lg">
+                <h2 className="text-2xl font-semibold mb-4 text-cyan-300 flex items-center"><DollarSign className="mr-3"/>Balance Final</h2>
+                <div className="space-y-4">
+                    {Object.keys(settlements).length === 0 && ( <p className="text-gray-400 text-center py-4">Añade gastos para ver los resultados.</p> )}
+                    {Object.keys(settlements).length > 0 && Object.values(settlements).every(arr => arr.length === 0) && ( <p className="text-green-400 text-center font-semibold py-4">¡Todas las cuentas están saldadas!</p> )}
+                    {Object.entries(settlements).map(([currency, transactions]) => (
+                        transactions.length > 0 &&
+                        <div key={currency}>
+                            <h3 className="text-lg font-semibold text-cyan-400 border-b-2 border-gray-700 pb-1 mb-2">Deudas en {currency}</h3>
+                            <div className="space-y-2">
+                                {transactions.map((trans, index) => (
+                                    <div key={index} className="bg-gray-700 p-3 rounded-lg flex items-center justify-center text-center animate-fade-in">
+                                        <span className="font-medium text-white">{trans.from}</span>
+                                        <ArrowRight className="mx-4 text-cyan-500" size={20}/>
+                                        <span className="font-medium text-white">{trans.to}</span>
+                                        <span className="ml-auto font-bold text-lg text-green-400">{trans.amount.toFixed(2)} {trans.currency}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            </div>
+        );
 
+        const TotalExpensesPanel = ({ totals }) => (
+            <div className="bg-gray-800 p-6 rounded-xl shadow-lg">
+                <h2 className="text-2xl font-semibold mb-4 text-cyan-300 flex items-center"><Wallet className="mr-3"/>Gasto Total</h2>
+                <div className="space-y-2">
+                    {Object.keys(totals).length === 0 ? (
+                        <p className="text-gray-400 text-center py-4">No hay gastos para mostrar.</p>
+                    ) : (
+                        Object.entries(totals).map(([currency, total]) => (
+                            <div key={currency} className="flex justify-between items-center bg-gray-700 p-3 rounded-lg">
+                                <span className="text-lg font-medium text-white">{currency}</span>
+                                <span className="text-xl font-bold text-cyan-400">{total.toFixed(2)}</span>
+                            </div>
+                        ))
+                    )}
+                </div>
+            </div>
+        );
 
         // --- Renderizar la aplicación ---
         const container = document.getElementById('root');
